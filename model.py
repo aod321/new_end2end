@@ -33,15 +33,12 @@ class Stage1Model(nn.Module):
         preds = self.model(img)
         # Preds Shape(N, 9, 512, 512)
         # Calc centroids
-        one_preds = (F.softmax(preds, dim=1) > 0.5).float()
-        cens = calc_centroid(one_preds) * 8  # Shape(N, 9, 2)
-        # eye1 = cens[:, 3]
-        # eye2 = cens[:, 4]
-        eye1 = (cens[:, 1] + cens[:, 3]) / 2.0
-        eye2 = (cens[:, 2] + cens[:, 4]) / 2.0
-        nose = cens[:, 5]
-        mouth = (cens[:, 6] + cens[:, 7] + cens[:, 8]) / 3.0
-        points = torch.stack([eye1, eye2, nose, mouth], dim=1)  # Shape(N, 4, 2)
+        big_preds = (F.interpolate(F.softmax(preds, dim=1), (512, 512)) > 0.5).float()
+        # one_preds = (F.softmax(preds, dim=1) > 0.5).float()
+        cens = calc_centroid(big_preds)  # Shape(N, 9, 2)
+        mouth = (cens[:, 6:7] + cens[:, 7:8] + cens[:, 8:9]) / 3.0
+        points = torch.cat([cens[:, 1:6], mouth], dim=1)  # Shape(N, 6, 2)
+        assert points.shape == (img.shape[0], 6, 2)
         if orig:
             parts, parts_label = self.select_net(orig['image'], orig['label'], points)
         else:
@@ -50,138 +47,63 @@ class Stage1Model(nn.Module):
         return preds, parts, parts_label
 
     # Preds Shape(N, 9, 512, 512)
-    # Parts Shape(N, 4, 3, 64, 64)
-    # Parts_labels Shape(N, 4, 64, 64) CrossEn
+    # Parts Shape(N, 6, 3, 64, 64)
+    # Parts_labels Shape(N, 6, 64, 64) CrossEn
 
 
 class SelectNet(nn.Module):
     def __init__(self):
         super(SelectNet, self).__init__()
         self.theta = None
-        self.rtheta = None
         self.points = None
         self.device = None
 
-    def get_theta(self):
-        self.device = self.points.device
-        # points in [N, 4, 2]
-        points_in = self.points
-        # print(points_in)
-        N = points_in.shape[0]
-        param = torch.zeros((N, 4, 2, 3)).to(self.device)
-        for i in range(2):
-            points_in[:, i, 0] = 256 - 8 * points_in[:, i, 0]
-            points_in[:, i, 1] = 256 - 8 * points_in[:, i, 1]
-            param[:, i, 0, 0] = 8
-            param[:, i, 0, 2] = points_in[:, i, 1]
-            param[:, i, 1, 1] = 8
-            param[:, i, 1, 2] = points_in[:, i, 0]
-
-        for i in range(2, 4):
-            points_in[:, i, 0] = 256 - 6.4 * points_in[:, i, 0]
-            points_in[:, i, 1] = 256 - 6.4 * points_in[:, i, 1]
-            param[:, i, 0, 0] = 6.4
-            param[:, i, 0, 2] = points_in[:, i, 1]
-            param[:, i, 1, 1] = 6.4
-            param[:, i, 1, 2] = points_in[:, i, 0]
-        # Param Shape(N, 4, 2, 3)
-        # Every label has a affine param
-        ones = torch.tensor([[0., 0., 1.]]).repeat(N, 4, 1, 1).to(self.device)
-        param = torch.cat([param, ones], dim=2)
-        param = torch.inverse(param)
-        # ---               ---
-        # Then, convert all the params to thetas
-        self.theta = torch.zeros([N, 4, 2, 3]).to(self.device)
-        self.theta[:, :, 0, 0] = param[:, :, 0, 0]
-        self.theta[:, :, 0, 1] = param[:, :, 0, 1]
-        self.theta[:, :, 0, 2] = param[:, :, 0, 2] * 2 / 512 + self.theta[:, :, 0, 0] + self.theta[:, :, 0, 1] - 1
-        self.theta[:, :, 1, 0] = param[:, :, 1, 0]
-        self.theta[:, :, 1, 1] = param[:, :, 1, 1]
-        self.theta[:, :, 1, 2] = param[:, :, 1, 2] * 2 / 512 + self.theta[:, :, 1, 0] + self.theta[:, :, 1, 1] - 1
-        # theta Shape(N, 4, 2, 3)
-        return self.theta
-
-    def reverse_transform(self, preds):
-        N = self.theta.shape[0]
-        ones = torch.tensor([[0., 0., 1.]]).repeat(N, 4, 1, 1).to(self.device)
-        self.rtheta = torch.cat([self.theta, ones], dim=2).to(self.device)
-        self.rtheta = torch.inverse(self.rtheta)
-        self.rtheta = self.rtheta[:, :, 0:2]
-        assert self.rtheta.shape == (N, 4, 2, 3)
-        del ones
-        eye1_pred, eye2_pred, nose_pred, mouth_pred = preds
-        # Parts_pred argmax Shape(N, 64, 64)
-        eye1_pred = eye1_pred.argmax(dim=1, keepdim=False).float()
-        eye2_pred = eye2_pred.argmax(dim=1, keepdim=False).float()
-        nose_pred = nose_pred.argmax(dim=1, keepdim=False).float()
-        mouth_pred = mouth_pred.argmax(dim=1, keepdim=False).float()
-        eye1_pred[eye1_pred == 1] = 1
-        eye1_pred[eye1_pred == 2] = 3
-
-        eye2_pred[eye2_pred == 2] = 4
-        eye2_pred[eye2_pred == 1] = 2
-        # np_eye2_pred = eye2_pred.detach().cpu().numpy()
-
-        nose_pred[nose_pred == 1] = 5
-
-        mouth_pred[mouth_pred == 1] = 6
-        mouth_pred[mouth_pred == 2] = 7
-        mouth_pred[mouth_pred == 3] = 8
-        predicts = torch.stack([eye1_pred, eye2_pred, nose_pred, mouth_pred], dim=1)
-        # del eye1_pred, eye2_pred, nose_pred, mouth_pred
-        assert predicts.shape == (N, 4, 64, 64)
-
-        sample = torch.zeros((N, 1, 512, 512)).to(self.device)
-        for i in range(4):
-            grid = F.affine_grid(theta=self.rtheta[:, i], size=[N, 1, 512, 512], align_corners=True).to(self.device)
-            pred = torch.unsqueeze(predicts[:, i], dim=1).to(self.device)
-            sample += F.grid_sample(input=pred, grid=grid, mode='nearest', align_corners=True)
-            # sample[sample>8] = 0
-            # del grid, pred
-        # np_sample = sample.detach().cpu().numpy()
-        # del predicts
-        return sample
-
     def forward(self, img, label, points):
-        self.points = points.clone()
-        theta = self.get_theta()
+        # self.points = points[:, 1:]  # Shape(N, 8, 2)
+        self.points = points
         self.device = img.device
         n, l, h, w = img.shape
+        # self.points = torch.cat([self.points[:, 0:6],
+        #                          self.points[:, 6:9].mean(dim=1, keepdim=True)],
+        #                         dim=1)
+        # assert self.points.shape == (n, 6, 2)
+        theta = torch.zeros((n, 6, 2, 3)).to(self.device)
+        # Crop brow1 brow2 eye1 eye2 nose
+        for i in range(5):
+            theta[:, i, 0, 0] = 64 / w
+            theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / w
+            theta[:, i, 1, 1] = 64 / h
+            theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / h
+        # Crop mouth
+        for i in range(5, 6):
+            theta[:, i, 0, 0] = 80 / w
+            theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / w
+            theta[:, i, 1, 1] = 80 / h
+            theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / h
+        self.theta = theta
         samples = []
         labels = []
-        for i in range(4):
+        for i in range(6):
             grid = F.affine_grid(theta[:, i], [n, l, 64, 64], align_corners=True).to(img.device)
             samples.append(F.grid_sample(input=img, grid=grid, align_corners=True))
-            labels.append(F.grid_sample(input=torch.unsqueeze(label, dim=1), mode='nearest',grid=grid, align_corners=True))
-        samples = torch.stack(samples, dim=0)
-        samples = samples.transpose(1, 0)
+            labels.append(
+                F.grid_sample(input=torch.unsqueeze(label, dim=1), mode='nearest', grid=grid, align_corners=True))
+        samples = torch.stack(samples, dim=0).transpose(1, 0)
         labels = torch.cat(labels, dim=1)
-        assert samples.shape == (n, 4, 3, 64, 64)
-        assert labels.shape == (n, 4, 64, 64)
+        assert samples.shape == (n, 6, 3, 64, 64)
+        assert labels.shape == (n, 6, 64, 64)
         # 单个成分labels 的Shape都是(N, 64, 64) ，以下程序处理序号以方便CrossEntropy训练
-        eye1_labels = labels[:, 0]
-        eye2_labels = labels[:, 1]
-        nose_labels = labels[:, 2]
-        mouth_labels = labels[:, 3]
-
-        eye1_labels[(eye1_labels != 3) * (eye1_labels != 1)] = 0  # bg
-        eye1_labels[eye1_labels == 1] = 1  # eyebrow1
-        eye1_labels[eye1_labels == 3] = 2  # eye1
-
-        eye2_labels[(eye2_labels != 4) * (eye2_labels != 2)] = 0  # bg
-        eye2_labels[eye2_labels == 2] = 1  # eyebrow2
-        eye2_labels[eye2_labels == 4] = 2  # eye2
-
-        nose_labels[nose_labels != 5] = 0  # bg
-        nose_labels[nose_labels == 5] = 1  # nose
-
+        mouth_labels = labels[:, 5:6]
         mouth_labels[(mouth_labels != 6) * (mouth_labels != 7) * (mouth_labels != 8)] = 0  # bg
         mouth_labels[mouth_labels == 6] = 1  # up_lip
         mouth_labels[mouth_labels == 7] = 2  # in_mouth
         mouth_labels[mouth_labels == 8] = 3  # down_lip
+        for i in range(5):
+            labels[:, i][labels[:, i] != i+1] = 0
+            labels[:, i][labels[:, i] == i+1] = 1
 
-        labels = torch.stack([eye1_labels, eye2_labels, nose_labels, mouth_labels], dim=1)
-        assert labels.shape == (img.shape[0], 4, 64, 64)
+        labels = torch.cat([labels[:, 0:5], mouth_labels], dim=1)
+        assert labels.shape == (img.shape[0], 6, 64, 64)
 
         return samples, labels
 
@@ -189,23 +111,18 @@ class SelectNet(nn.Module):
 class Stage2Model(nn.Module):
     def __init__(self):
         super(Stage2Model, self).__init__()
-        self.eye1_model = EyeModel()
-        self.eye2_model = EyeModel()
-        self.nose_model = NoseModel()
+        self.single_model = nn.ModuleList([SingleModel()
+                                           for _ in range(5)])
         self.mouth_model = MouthModel()
 
     def forward(self, parts):
-        eye1 = parts[:, 0]
-        eye2 = parts[:, 1]
-        nose = parts[:, 2]
-        mouth = parts[:, 3]
         # Shape(N, 3, 64, 64)
-        out_eye1 = self.eye1_model(eye1)
-        out_eye2 = self.eye1_model(eye2)
-        out_nose = self.nose_model(nose)
-        out_mouth = self.mouth_model(mouth)
-
-        return out_eye1, out_eye2, out_nose, out_mouth
+        out = []
+        for i in range(5):
+            out.append(self.single_model[i](parts[:, i]))
+        out_mouth = self.mouth_model(parts[:, 5])   # (N, 4, 64, 64)
+        out.append(out_mouth)
+        return out
 
 
 class PartsModel(nn.Module):
@@ -219,15 +136,9 @@ class PartsModel(nn.Module):
         return out
 
 
-class EyeModel(PartsModel):
+class SingleModel(PartsModel):
     def __init__(self):
-        super(EyeModel, self).__init__()
-        self.model.set_label_channels(3)
-
-
-class NoseModel(PartsModel):
-    def __init__(self):
-        super(NoseModel, self).__init__()
+        super(SingleModel, self).__init__()
         self.model.set_label_channels(2)
 
 
@@ -246,33 +157,32 @@ class ReverseTModel(nn.Module):
     def forward(self, preds, theta):
         self.device = theta.device
         N = theta.shape[0]
-        ones = torch.tensor([[0., 0., 1.]]).repeat(N, 4, 1, 1).to(self.device)
+        ones = torch.tensor([[0., 0., 1.]]).repeat(N, 6, 1, 1).to(self.device)
         self.rtheta = torch.cat([theta, ones], dim=2).to(self.device)
         self.rtheta = torch.inverse(self.rtheta)
         self.rtheta = self.rtheta[:, :, 0:2]
-        assert self.rtheta.shape == (N, 4, 2, 3)
+        assert self.rtheta.shape == (N, 6, 2, 3)
         del ones
         # Parts_pred argmax Shape(N, 64, 64)
         fg = []
         bg = []
-        for i in range(4):
+        for i in range(6):
             all_pred = F.softmax(preds[i], dim=1)
             grid = F.affine_grid(theta=self.rtheta[:, i], size=[N, preds[i].shape[1], 512, 512], align_corners=True).to(
                 self.device)
             bg_grid = F.affine_grid(theta=self.rtheta[:, i], size=[N, 1, 512, 512], align_corners=True).to(
                 self.device)
             temp = F.grid_sample(input=all_pred, grid=grid, mode='nearest', padding_mode='zeros', align_corners=True)
-            temp2 = F.grid_sample(input=all_pred[:, 0:1], grid=bg_grid, mode='nearest', padding_mode='border', align_corners=True)
+            temp2 = F.grid_sample(input=all_pred[:, 0:1], grid=bg_grid, mode='nearest', padding_mode='border',
+                                  align_corners=True)
             bg.append(temp2)
             fg.append(temp[:, 1:])
             # del temp, temp2
         bg = torch.cat(bg, dim=1)
-        bg = (bg[:, 0] * bg[:, 1] * bg[:, 2] * bg[:, 3]).unsqueeze(dim=1)
+        bg = (bg[:, 0:1] * bg[:, 1:2] * bg[:, 2:3] * bg[:, 3:4] *
+              bg[:, 4:5] * bg[:, 5:6])
         fg = torch.cat(fg, dim=1)  # Shape(N, 8, 512 ,512)
-        sample = torch.cat([bg, fg[:, 0:1], fg[:, 2:3], fg[:, 1:2], fg[:, 3:]], dim=1)  # Shape(N, 9, 512, 512)
-
-
-        # np_sample = sample.detach().cpu().numpy()
+        sample = torch.cat([bg, fg], dim=1)
         assert sample.shape == (N, 9, 512, 512)
         return sample
 
@@ -285,7 +195,5 @@ class TwoStagePipeLine(nn.Module):
 
     def forward(self, img, label):
         preds, parts, parts_label = self.stage1_model(img, label)
-        eye1, eye2, nose, mouth = parts[:, 0], parts[:, 1], parts[:, 2], parts[:, 3]
-        eye1_pred, eye2_pred, nose_pred, mouth_pred = self.stage2_model(eye1, eye2, nose, mouth)
-
-        return preds, eye1_pred, eye2_pred, nose_pred, parts_label
+        stage2_preds = self.stage2_model(parts)
+        return preds, stage2_preds

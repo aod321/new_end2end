@@ -1,13 +1,12 @@
 import torch
-import torch.nn.functional as F
 import torchvision
 import torch.nn as nn
 import torch.optim as optim
 from template import TemplateModel, F1Accuracy
-from model import Stage2Model, Stage1Model, ReverseTModel
+from model import Stage2Model
 from torch.utils.data import DataLoader
-from dataset import HelenDataset
-from prepgress import Resize, ToPILImage, ToTensor
+from dataset import PartsDataset, Stage2Augmentation
+from prepgress import Stage2Resize, Stage2ToTensor
 from torchvision import transforms
 import argparse
 import numpy as np
@@ -21,248 +20,217 @@ uuid = str(uid.uuid1())[0:8]
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", default=16, type=int, help="Batch size to use during training.")
 parser.add_argument("--display_freq", default=10, type=int, help="Display frequency")
-parser.add_argument("--lr", default=0.0001, type=float, help="Learning rate for optimizer")
+parser.add_argument("--lr", default=0.001, type=float, help="Learning rate for optimizer")
 parser.add_argument("--epochs", default=25, type=int, help="Number of epochs to train")
 parser.add_argument("--cuda", default=0, type=int, help="Choose GPU with cuda number")
 parser.add_argument("--eval_per_epoch", default=1, type=int, help="eval_per_epoch ")
+parser.add_argument("--workers", default=4, type=int, help="workers ")
+
 args = parser.parse_args()
 print(args)
 
-# Dataset Read_in Part
-root_dir = "/data1/yinzi/datas"
-# root_dir = '/home/yinzi/Downloads/datas'
-
-txt_file_names = {
-    'train': "exemplars.txt",
-    'val': "tuning.txt"
-}
-
-transforms_list = {
-    'train':
-        transforms.Compose([
-            ToPILImage(),
-            # RandomRotation(15),
-            # RandomResizedCrop((64, 64), scale=(0.9, 1.1)),
-            # CenterCrop((512,512)),
-            Resize((64, 64)),
-            ToTensor()
-            # Normalize()
-        ]),
-    'val':
-        transforms.Compose([
-            ToPILImage(),
-            Resize((64, 64)),
-            ToTensor()
-            # Normalize()
-        ])
-}
-# Stage 1 augmentation
-stage1_dataset = {x: HelenDataset(txt_file=txt_file_names[x],
-                                  root_dir=root_dir,
-                                  transform=transforms.Compose([
-                                      ToPILImage(),
-                                      Resize((64, 64)),
-                                      ToTensor()
-                                  ])
-                                  )
-                  for x in ['train', 'val']
-                  }
-stage1_dataloaders = {x: DataLoader(stage1_dataset[x], batch_size=args.batch_size,
-                                    shuffle=True, num_workers=4)
-                      for x in ['train', 'val']}
-
-stage1_dataset_sizes = {x: len(stage1_dataset[x]) for x in ['train', 'val']}
+name_list = ['eyebrow1', 'eyebrow2', 'eye1', 'eye2', 'nose', 'mouth']
 
 
 class TrainModel(TemplateModel):
-
-    def __init__(self, argus=args):
+    def __init__(self, dataset_class, txt_file, root_dir, transform, num_workers):
         super(TrainModel, self).__init__()
-        self.label_channels = 9
-        # ============== not neccessary ===============
-        self.train_logger = None
-        self.eval_logger = None
-        self.args = argus
+        self.writer = SummaryWriter('logs')
+        self.args = args
 
-        # ============== neccessary ===============
-        self.writer = SummaryWriter('log')
+        self.label_num = 6
+
         self.step = 0
         self.epoch = 0
-        self.best_error = float('Inf')
-        self.best_accu = float('-Inf')
-
+        self.best_error = [float('Inf')
+                           for _ in range(self.label_num)]
         self.device = torch.device("cuda:%d" % args.cuda if torch.cuda.is_available() else "cpu")
 
         self.model = Stage2Model().to(self.device)
-        self.model1 = Stage1Model().to(self.device)
-        # self.reverse = ReverseTModel().to(self.device)
-        # self.optimizer = optim.SGD(self.model.parameters(), self.args.lr,  momentum=0.9, weight_decay=0.0)
-        self.optimizer = optim.Adam(self.model.parameters(), self.args.lr)
+        self.optimizer = [optim.Adam(self.model.parameters(), self.args.lr)
+                          for _ in range(self.label_num)]
         self.criterion = nn.CrossEntropyLoss()
-        # self.criterion = nn.BCEWithLogitsLoss()
-        # self.metric = nn.CrossEntropyLoss()
-        self.metric = F1Accuracy()
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=5, gamma=0.5)
+        self.metric = nn.CrossEntropyLoss()
 
-        self.train_loader = stage1_dataloaders['train']
-        self.eval_loader = stage1_dataloaders['val']
+        self.train_loader = None
+        self.eval_loader = None
 
         self.ckpt_dir = "checkpoints_%s" % uuid
-        self.display_freq = args.display_freq
-
-        # call it to check all members have been intiated
-        self.check_init()
+        self.scheduler = [optim.lr_scheduler.StepLR(self.optimizer[r], step_size=5, gamma=0.5)
+                          for r in range(self.label_num)]
+        self.load_dataset(dataset_class, txt_file, root_dir, transform, num_workers)
 
     def train_loss(self, batch):
-        image, label = batch['image'].float().to(self.device), batch['labels'].float().to(self.device)
-        orig = {'image': batch['orig'].to(self.device),
-                'label': batch['orig_label'].to(self.device)}
-        preds, stage2_parts, stage2_labels = self.model1(image, label, orig)
-        stage2_preds = self.model(stage2_parts)
-        loss = self.criterion(all_predict, orig['label'].long())
-        # loss = self.criterion(pred, y)
-        # loss = self.criterion(preds, label.long())
-        # loss /= self.args.batch_size
-        # gt_grid = torchvision.utils.make_grid(torch.unsqueeze(label, dim=1))
-        # predicts = pred.argmax(dim=1, keepdim=False)
-        # predicts = torch.unsqueeze(predicts, dim=1)
-        # predicts_grid = torchvision.utils.make_grid(predicts)
-        # self.writer.add_image('ground_truth_%s' % uuid, gt_grid[0], global_step=self.step, dataformats='HW')
-        # self.writer.add_image('predicts_%s' % uuid, predicts_grid[0], global_step=self.step, dataformats='HW')
-        return loss, None
+        image = batch['image'].to(self.device)
+        label = {x: batch['labels'][x].to(self.device)
+                 for x in name_list
+                 }
+
+        # Image Shape(N, 6, 3, 64, 64)
+        pred = self.model(image)
+        loss = [self.criterion(pred[i], label[name_list[i]].argmax(dim=1, keepdim=False))
+                for i in range(len(pred))]
+
+        return loss
 
     def eval_error(self):
-        loss_list = []
-        for batch in self.eval_loader:
-            image, label = batch['image'].float().to(self.device), batch['labels'].float().to(self.device)
-            orig = {'image': batch['orig'].to(self.device),
-                    'label': batch['orig_label'].to(self.device)}
-            preds, stage2_parts, stage2_labels = self.model1(image, label, orig)
-            stage_preds = self.model(stage2_parts)
-            all_predict = self.reverse(preds=stage_preds, theta=self.model1.select_net.theta)
-            error = self.metric(all_predict, orig['label'].long())
-            loss_list.append(error.item())
+        # Image Shape(N, 6, 3, 64, 64)
+        error = []
+        counts = 0
+        for i, batch in enumerate(self.eval_loader):
+            counts += 1
+            parts = batch['image'].to(self.device)
+            labels = {x: batch['labels'][x].to(self.device)
+                      for x in name_list
+                      }
+            pred = self.model(parts)
+            for r in range(len(pred)):
+                error.append((self.metric(pred[r],
+                                          labels[name_list[r]].argmax(dim=1, keepdim=False)
+                                          )).item()
+                             )
 
-        return np.mean(loss_list), None
+        return error
+
+    def eval(self):
+        self.model.eval()
+        with torch.no_grad():
+            error = self.eval_error()
+
+        if os.path.exists(self.ckpt_dir) is False:
+            os.makedirs(self.ckpt_dir)
+
+        for j in range(6):
+            if error[j] < self.best_error[j]:
+                self.best_error[j] = error[j]
+                self.save_state(os.path.join(self.ckpt_dir, 'best_%s.pth.tar' % name_list[j]), False)
+        self.save_state(os.path.join(self.ckpt_dir, '{}.pth.tar'.format(self.epoch)), False)
+        self.writer.add_scalar('error_eyebrow1_%s' % uuid, error[0], self.epoch)
+        self.writer.add_scalar('error_eyebrow2_%s' % uuid, error[1], self.epoch)
+        self.writer.add_scalar('error_eye1_%s' % uuid, error[2], self.epoch)
+        self.writer.add_scalar('error_eye2_%s' % uuid, error[3], self.epoch)
+        self.writer.add_scalar('error_nose_%s' % uuid, error[4], self.epoch)
+        self.writer.add_scalar('error_mouth_%s' % uuid, error[5], self.epoch)
+        print('\n==============================')
+        print('epoch {} finished\n'
+              'error_eyebrow1 {:.3}\terror_eyebrow2 {:.3}\terror_eye1 {:.3}\t'
+              'error_eye2 {:.3}\terror_nose {:.3}\terror_mouth {:.3}\n'
+              'best_error_eyebrow1 {:.3}\tbest_error_eyebrow2 {:.3}\t'
+              'best_error_eye1 {:.3}\tbest_error_eye2 {:.3}\tbest_error_nose {:.3}\tbest_error_mouth {:.3}\n'
+              'best_error_mean {:.3}'
+              .format(self.epoch, error[0], error[1], error[2], error[3], error[4], error[5],
+                      self.best_error[0], self.best_error[1], self.best_error[2],
+                      self.best_error[3], self.best_error[4], self.best_error[5],
+                      np.mean(self.best_error)))
+        print('==============================\n')
+        if self.eval_logger:
+            self.eval_logger(self.writer)
+
+        torch.cuda.empty_cache()
 
     def train(self):
         self.model.train()
         self.epoch += 1
-        for batch in self.train_loader:
+        for i, batch in enumerate(self.train_loader):
             self.step += 1
-            self.optimizer.zero_grad()
-
-            loss, others = self.train_loss(batch)
-
-            loss.backward()
-            self.optimizer.step()
-
-            if self.step % self.display_freq == 0:
-                self.writer.add_scalar('loss_%s' % uuid, loss.item(), self.step)
-
-                print('epoch {}\tstep {}\tloss {:.3}'.format(self.epoch, self.step, loss.item()))
+            for k in range(self.label_num):
+                self.optimizer[k].zero_grad()
+            loss = self.train_loss(batch)
+            for k in range(self.label_num):
+                loss[k].backward()
+                self.optimizer[k].step()
+            loss_item = [loss[k].item()
+                         for k in range(self.label_num)]
+            if self.step % args.display_freq == 0:
+                self.writer.add_scalar('loss_eyebrow1_%s' % uuid, loss_item[0], self.step)
+                self.writer.add_scalar('loss_eyebrow2_%s' % uuid, loss_item[1], self.step)
+                self.writer.add_scalar('loss_eye1_%s' % uuid, loss_item[2], self.step)
+                self.writer.add_scalar('loss_eye2_%s' % uuid, loss_item[3], self.step)
+                self.writer.add_scalar('loss_nose_%s' % uuid, loss_item[4], self.step)
+                self.writer.add_scalar('loss_mouth_%s' % uuid, loss_item[5], self.step)
+                print('epoch {}\tstep {}\n'
+                      'loss_eyebrow1 {:.3}\tloss_eyebrow2 {:.3}\t'
+                      'loss_eye1 {:.3}\tloss_eye2 {:.3}\tloss_nose {:.3}\tloss_mouth {:.3}\n'
+                      'loss_all_mean {:.3}'.format(
+                    self.epoch, self.step, loss_item[0], loss_item[1], loss_item[2],
+                    loss_item[3], loss_item[4], loss_item[5], np.mean(loss_item)
+                ))
                 if self.train_logger:
-                    self.train_logger(self.writer, others)
+                    self.train_logger(self.writer)
 
-    def load_statefiles(self, fname, map_location, model='model1'):
-        if model == 'model1':
-            path = os.path.join(fname, 'best.pth.tar')
-            state = torch.load(path, map_location=map_location)
-            if isinstance(self.model1, torch.nn.DataParallel):
-                self.model1.module.load_state_dict(state['model'])
-            else:
-                self.model1.load_state_dict(state['model'])
+        torch.cuda.empty_cache()
 
-        if model == 'model2':
-            path = [os.path.join(fname, 'best_%s.pth.tar' % x)
-                    for x in ['eye1', 'eye2', 'nose', 'mouth']]
-            state = [torch.load(path[i], map_location=map_location)
-                     for i in range(4)]
+    def load_state(self, fname, optim=True, map_location=None):
+        path = [os.path.join(fname, 'best_%s.pth.tar' % x)
+                for x in name_list]
+        state = [torch.load(path[i], map_location=map_location)
+                 for i in range(self.label_num)]
 
-            if isinstance(self.model, torch.nn.DataParallel):
-                self.model.module.load_state_dict(state[0]['model'])
-                best_eye1 = self.model.module.eye1_model
-                self.model.module.load_state_dict(state[1]['model'])
-                best_eye2 = self.model.module.eye2_model
-                self.model.module.load_state_dict(state[2]['model'])
-                best_nose = self.model.module.nose_model
-                self.model.module.load_state_dict(state[3]['model'])
-                best_mouth = self.model.module.mouth_model
-                self.model.module.eye1_model = best_eye1
-                self.model.module.eye2_model = best_eye2
-                self.model.module.nose_model = best_nose
-                self.model.module.mouth_model = best_mouth
+        temp_state = []
+        if isinstance(self.model, torch.nn.DataParallel):
+            for i in range(5):
+                self.model.module.load_state_dict(state[i]['model'])
+                temp_state.append(self.model.module.single_model[i])
+            temp_state.append(self.model.module.mouth_model)
+            for i in range(5):
+                self.model.module.single_model[i] = temp_state[i]
+            self.model.module.mouth_model = temp_state[5]
 
-            else:
-                self.model.load_state_dict(state[0]['model'])
-                best_eye1 = self.model.eye1_model
-                self.model.load_state_dict(state[1]['model'])
-                best_eye2 = self.model.eye2_model
-                self.model.load_state_dict(state[2]['model'])
-                best_nose = self.model.nose_model
-                self.model.load_state_dict(state[3]['model'])
-                best_mouth = self.model.mouth_model
-                self.model.eye1_model = best_eye1
-                self.model.eye2_model = best_eye2
-                self.model.nose_model = best_nose
-                self.model.mouth_model = best_mouth
+        else:
+            for i in range(5):
+                self.model.load_state_dict(state[i]['model'])
+                temp_state.append(self.model.single_model[i])
+            temp_state.append(self.model.mouth_model)
+            for i in range(5):
+                self.model.single_model[i] = temp_state[i]
+            self.model.mouth_model = temp_state[5]
 
-        print('load model from {}'.format(fname))
+            print('load model from {}'.format(fname))
 
-class Train_F1_eval(TrainModel):
+    def load_dataset(self, dataset_class, txt_file, root_dir, transform, num_workers):
 
-    def eval(self):
-        self.model.eval()
-        accu, others = self.eval_accu()
+        data_after = Stage2Augmentation(dataset=dataset_class,
+                                        txt_file=txt_file,
+                                        root_dir=root_dir,
+                                        resize=(64, 64)
+                                        )
 
-        if accu > self.best_accu:
-            self.best_accu = accu
-            self.save_state(os.path.join(self.ckpt_dir, 'best.pth.tar'), False)
-        self.save_state(os.path.join(self.ckpt_dir, '{}.pth.tar'.format(self.epoch)))
-        self.writer.add_scalar('accu_%s' % uuid, accu, self.epoch)
-        print('epoch {}\taccu {:.3}\tbest_accu {:.3}'.format(self.epoch, accu, self.best_accu))
+        Dataset = data_after.get_dataset()
+        # Dataset = {x: dataset_class(txt_file=txt_file[x],
+        #                             root_dir=root_dir,
+        #                             transform=transform
+        #                             )
+        #            for x in ['train', 'val']
+        #            }
+        Loader = {x: DataLoader(Dataset[x], batch_size=args.batch_size,
+                                shuffle=True, num_workers=num_workers)
+                  for x in ['train', 'val']
+                  }
+        self.train_loader = Loader['train']
+        self.eval_loader = Loader['val']
 
-        if self.eval_logger:
-            self.eval_logger(self.writer, others)
-
-        return accu
-
-    def eval_accu(self):
-        accu_list = []
-        # pred_list = []
-        # label_list = []
-        for batch in self.eval_loader:
-            image, label = batch['image'].float().to(self.device), batch['labels'].float().to(self.device)
-            orig = {'image': batch['orig'].to(self.device),
-                    'label': batch['orig_label'].to(self.device)}
-            preds, stage2_parts, stage2_labels = self.model1(image, label, orig)
-            stage_preds = self.model(stage2_parts)
-            all_predict = self.reverse(preds=stage_preds, theta=self.model1.select_net.theta)
-            all_predict = torch.squeeze(all_predict, dim=1)
-            all_predict = F.one_hot(all_predict.long(), num_classes=-1).to(self.device)
-            all_predict = all_predict.permute(0, 3, 1, 2)
-            accu = self.metric(all_predict, orig['label'].long())
-            accu_list.append(accu)
-
-        predicts = all_predict.argmax(dim=1, keepdim=False)
-        predicts = torch.unsqueeze(predicts, dim=1)
-        predicts_grid = torchvision.utils.make_grid(predicts)
-        self.writer.add_image('predicts_%s' % uuid, predicts_grid[0], global_step=self.epoch, dataformats='HW')
-
-        return np.mean(accu_list), None
+        return Loader
 
 
-def start_train():
-    state_files = {'model1': '/home/yinzi/data3/vimg18/python_projects/new_end2end/checkpoints_1c80dfb0',
-                   'model2': '/home/yinzi/data3/vimg18/python_projects/three_face/checkpoint_d02d957f'}
-    print(uuid)
-    # train = TrainModel(args)
-    train = Train_F1_eval(args)
-    train.load_statefiles(state_files['model1'], train.device, 'model1')
-    train.load_statefiles(state_files['model2'], train.device, 'model2')
+def start_train(model_path=None):
+    dataset_class = PartsDataset
+    txt_file_names = {
+        'train': "exemplars.txt",
+        'val': "tuning.txt"
+    }
+    root_dir = "/data1/yinzi/facial_parts"
+    transform = transforms.Compose([Stage2Resize((64, 64)),
+                                    Stage2ToTensor()
+                                    ])
+
+    train = TrainModel(dataset_class, txt_file_names, root_dir, transform, num_workers=args.workers)
+    if model_path:
+        train.load_state(model_path)
+
     for epoch in range(args.epochs):
         train.train()
-        train.scheduler.step()
+        for i in range(6):
+            train.scheduler[i].step(epoch)
         if (epoch + 1) % args.eval_per_epoch == 0:
             train.eval()
 
@@ -270,3 +238,4 @@ def start_train():
 
 
 start_train()
+# start_train(model_path="/home/yinzi/data3/vim

@@ -34,6 +34,7 @@ class Simple_two(object):
         self.all_predict = None
         self.best_error = float('Inf')
 
+        self.name_list = ['eyebrow1', 'eyebrow2', 'eye1', 'eye2', 'nose', 'mouth']
         self.F1_name_list = ['eyebrow1', 'eyebrow2',
                              'eye1', 'eye2',
                              'nose', 'u_lip', 'i_mouth', 'l_lip']
@@ -123,37 +124,28 @@ class Simple_two(object):
 
         if model == 'model2':
             path = [os.path.join(fname, 'best_%s.pth.tar' % x)
-                    for x in ['eye1', 'eye2', 'nose', 'mouth']]
-            state = [torch.load(path[i], map_location=self.map_location)
-                     for i in range(4)]
+                    for x in self.name_list]
+            state = [torch.load(path[i], map_location=map_location)
+                     for i in range(6)]
 
+            temp_state = []
             if isinstance(self.model2, torch.nn.DataParallel):
-                self.model2.module.load_state_dict(state[0]['model'])
-                best_eye1 = self.model2.module.eye1_model
-                self.model2.module.load_state_dict(state[1]['model'])
-                best_eye2 = self.model2.module.eye2_model
-                self.model2.module.load_state_dict(state[2]['model'])
-                best_nose = self.model2.module.nose_model
-                self.model2.module.load_state_dict(state[3]['model'])
-                best_mouth = self.model2.module.mouth_model
-                self.model2.module.eye1_model = best_eye1
-                self.model2.module.eye2_model = best_eye2
-                self.model2.module.nose_model = best_nose
-                self.model2.module.mouth_model = best_mouth
+                for i in range(5):
+                    self.model2.module.load_state_dict(state[i]['model'])
+                    temp_state.append(self.model2.module.single_model[i])
+                temp_state.append(self.model2.module.mouth_model)
+                for i in range(5):
+                    self.model2.module.single_model[i] = temp_state[i]
+                self.model2.module.mouth_model = temp_state[5]
 
             else:
-                self.model2.load_state_dict(state[0]['model'])
-                best_eye1 = self.model2.eye1_model
-                self.model2.load_state_dict(state[1]['model'])
-                best_eye2 = self.model2.eye2_model
-                self.model2.load_state_dict(state[2]['model'])
-                best_nose = self.model2.nose_model
-                self.model2.load_state_dict(state[3]['model'])
-                best_mouth = self.model2.mouth_model
-                self.model2.eye1_model = best_eye1
-                self.model2.eye2_model = best_eye2
-                self.model2.nose_model = best_nose
-                self.model2.mouth_model = best_mouth
+                for i in range(5):
+                    self.model2.load_state_dict(state[i]['model'])
+                    temp_state.append(self.model2.single_model[i])
+                temp_state.append(self.model2.mouth_model)
+                for i in range(5):
+                    self.model2.single_model[i] = temp_state[i]
+                self.model2.mouth_model = temp_state[5]
 
         print('load model from {}'.format(fname))
 
@@ -239,30 +231,19 @@ class Simple_two(object):
             self.calc_f1(self.all_predict, orig['label'])
             # Shape(N, 1, 512, 512)
 
-            # all_grid = torchvision.utils.make_grid(self.all_predict).detach().cpu()
-            # plt.imshow(all_grid[0])
-            # print("orig img imshow")
-            # orig_grid = torchvision.utils.make_grid(orig['image']).detach().cpu()
-            # plt.imshow(orig_grid.permute(1, 2, 0))
-            # plt.pause(0.0001)
-
-            # print("Stage1 pred imshow")
-            # stage1_pred = torchvision.utils.make_grid(torch.unsqueeze(preds.argmax(dim=1, keepdim=False),
-            #                                                           dim=1)).detach().cpu()
-            # plt.imshow(stage1_pred[0])
-            # plt.pause(0.0001)
-            # print("Stage2 predict imshow")
-            # for i in range(4):
-            #     s2_predict = self.predict2[i].argmax(dim=1, keepdim=True)
-            #     s2_predict = torchvision.utils.make_grid(s2_predict.detach().cpu())
-            #     plt.imshow(s2_predict[0])
-            #     plt.pause(0.0001)
+            print("Stage2 predict imshow")
+            for i in range(6):
+                s2_predict = self.predict2[i].argmax(dim=1, keepdim=True)
+                s2_predict = torchvision.utils.make_grid(s2_predict.detach().cpu())
+                plt.imshow(s2_predict[0])
+                plt.pause(0.0001)
 
             # print("Stage2 labels imshow")
             # for i in range(4):
             #     plabel_grid = torchvision.utils.make_grid(torch.unsqueeze(stage2_labels[:, i], dim=1).detach().cpu())
             #     plt.imshow(plabel_grid[0])
             #     plt.pause(0.0001)
+
             # self.predict2
             print("GroundTruth imshow")
             gt_grid = torchvision.utils.make_grid(torch.unsqueeze(orig['label'], dim=1)).detach().cpu()
@@ -361,7 +342,7 @@ class Simple_two(object):
 # # #
 # /home/yinzi/data3
 # state_files = {'model1': '/home/yinzi/data3/vimg18/python_projects/new_end2end/checkpoints_1c80dfb0',
-#                'model2': '/home/yinzi/data3/vimg18/python_projects/three_face/checkpoint_d02d957f'}
+#                'model2': '/home/yinzi/data3/vimg18/python_projects/new_end2end/checkpoints_e8f1dac0'}
 # testrun = Simple_two(batch_size=4, is_shuffle=False, num_workers=4, state_files=state_files)
-# # testrun.pipline()
-# testrun.train_stage2()
+# testrun.pipline()
+#
